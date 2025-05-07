@@ -1,0 +1,10 @@
+﻿Technology,LCOE_$/kW,GHG_Reduction_tCO2_per_kW,Reliability_Score,Capacity_Limit_MW,Load_Reduction_MW,Dispatchability
+Solar PV,1300,0.5,0.4,3000,0,Non-dispatchable
+Wind,1100,0.7,0.5,2500,0,Non-dispatchable
+Battery Storage,1000,0.2,0.9,1000,0,Balancing
+Pumped Storage,1200,0.25,0.95,800,0,Balancing
+Net Metering,1400,0.6,0.3,600,0,Non-dispatchable
+Time-of-Day Pricing,200,0.15,0.2,300,300,Demand-side
+Smart Grid,400,0.2,0.4,500,500,Demand-side
+T&D Upgrades,900,0.05,0.7,2000,0,Dispatchable
+EV Charging,700,-0.1,0.3,1500,0,Load-increasing
