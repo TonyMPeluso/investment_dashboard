@@ -24,13 +24,13 @@ Traditional long-term planning tools often evaluate technologies one by one or r
 
 This model solves two linked problems:
 
-1️⃣ Investment LP:
+#### 1️⃣ Investment LP:
 Optimizes installed capacities of technologies under cost or GHG objectives.
 
-2️⃣ Dispatch LP:
+#### 2️⃣ Dispatch LP:
 Checks hourly feasibility across a 24-hour representative day for each season (winter, summer, fall, spring), ensuring that load is met and storage behaves correctly.
 
-Real-world applications
+#### Real-world applications
 
 Utility planners can use this tool to:
 - Build GHG-minimizing portfolios aligned with Net Zero objectives
@@ -78,13 +78,14 @@ Utility planners can use this tool to:
 +-------------------------------------------------------------+
 
 ## 🔧 Optimization Model
-Decision Variables
 
-Investment LP
+### Decision Variables
+
+##### Investment LP
 - CapTech[t] — Installed capacity (MW) for technology t
 (Solar_PV, Wind, Net_Metering, Battery_Storage, Pumped_Hydro)
 
-Dispatch LP
+#### Dispatch LP
 - Dispatch[t, h] — Hourly output (MW)
 - Charge[t, h], Discharge[t, h] — For storage technologies
 - SOC[t, h] — State of charge
@@ -93,20 +94,20 @@ Dispatch LP
 
 Users select one of:
 
-1. Cost Minimization
+#### 1. Cost Minimization
 
 Uses capital + variable cost streams:
 ```
 Minimize Σ(t) [CapitalCost[t] * CapTech[t] + 
                Σ(h) VariableCost[t] * Dispatch[t,h]]
 ```
-2. GHG Minimization
+#### 2. GHG Minimization
 
 Minimizes tonnes of CO₂ displaced or emitted:
 ```
 Minimize Σ(t) [GHGIntensity[t] * EnergyProduced[t]]
 ```
-3. Weighted Objective
+#### 3. Weighted Objective
 
 A convex combination:
 ```
@@ -116,41 +117,43 @@ Obj = α * Cost + (1 - α) * GHG
 Where α is chosen with a slider in the UI.
 
 ### 📏 Core Constraints
-Load Balance (per hour)
+
+#### Load Balance (per hour)
 ```
 Σ_t Dispatch[t,h] + Discharge[h] = Load[h] + Charge[h]
 ```
-Storage Constraints
+#### Storage Constraints
 - Charge/discharge limits
 - Round-trip efficiency
 - SOC bounds
 - End-of-day SOC = start-of-day SOC (seasonal balance)
 
-Availability Limits
+#### Availability Limits
 ```
 Dispatch[t,h] ≤ CapTech[t] * Availability[t,h]
 ```
 
-Non-negativity and Capacity Bounds
+#### Non-negativity and Capacity Bounds
 ```
 CapTech[t] ≥ 0
 Dispatch[t,h] ≥ 0
 ```
 
 ## 📊 Dashboard Features
-Investment Summary Table
+
+### Investment Summary Table
 
 Shows optimized capacities, annual energy output, costs, and GHG effects.
 
-Supply Stack Chart
+### Supply Stack Chart
 
 A clear, stacked bar visualization of optimized generation mix.
 
-GHG Abatement Curve
+### GHG Abatement Curve
 
 Plots incremental abatement vs incremental cost.
 
-Seasonal Dispatch Plot
+### Seasonal Dispatch Plot
 
 For each season (winter/summer/fall/spring):
 - Solar + wind + net metering
@@ -158,7 +161,7 @@ For each season (winter/summer/fall/spring):
 - Load curve overlay
 - Visual inspection of hourly reliability
 
-Scenario Saving
+### Scenario Saving
 
 Outputs input assumptions + LP results to a JSON file.
 
@@ -191,21 +194,21 @@ investment_dashboard/
 ```
 
 ### ⚙️ Installation & Running Locally
-1. Create virtual environment
+
+#### 1. Create virtual environment
 ```
 python3 -m venv .venv
 source .venv/bin/activate
 ```
-2. Install dependencies
+#### 2. Install dependencies
 ```
 pip install -r requirements.txt
 ```
-3. Run the dashboard
+#### 3. Run the dashboard
 ```
 python3 -m shiny run --reload app/app.py
 ```
-
-Then visit:
+#### Then visit:
 
 👉 http://127.0.0.1:8000
 
