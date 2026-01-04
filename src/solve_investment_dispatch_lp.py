@@ -1,424 +1,504 @@
-import os
-from typing import Dict, List, Tuple, Optional
+"""
+Investment + Dispatch Optimization Solver
 
-import numpy as np
+This module implements a linear programming model that:
+- Determines optimal investment capacity by technology
+- Dispatches resources hourly to meet load
+- Models storage and smart grid as balancing resources
+- Applies renewable availability constraints
+- Computes proxy LCOE and abatement metrics
+
+The solver is designed to be called from a Shiny application
+but can also be used standalone for batch analysis.
+
+Author: Anthony Peluso
+Project: Investment Optimization Dashboard
+"""
+
+# ============================
+# Third-party imports
+# ============================
 import pandas as pd
-from pulp import LpProblem, LpMinimize, LpVariable, lpSum, LpStatus
+import numpy as np
+from pulp import (
+    LpProblem,
+    LpMinimize,
+    LpVariable,
+    lpSum,
+    LpStatus,
+    value,
+)
 
+# -----------------------------
+# helpers
+# -----------------------------
+def _norm(name: str) -> str:
+    """Normalize tech names across CSVs: spaces -> underscores, trim."""
+    return str(name).strip().replace(" ", "_")
 
-def _clean_cols(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = df.columns.astype(str).str.strip().str.strip('"').str.strip("'")
-    return df
+def _as_float(x, default=0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return float(default)
 
-
-def _capital_recovery_factor(discount_rate: float, asset_life_years: float) -> float:
-    """
-    CRF converts upfront capex into an equivalent annual payment.
-    """
-    r = float(discount_rate)
-    n = float(asset_life_years)
-
-    if n <= 0:
-        return 1.0
-    if abs(r) < 1e-12:
-        return 1.0 / n
-
-    x = (1.0 + r) ** n
-    return (r * x) / (x - 1.0)
-
-
+# ============================================================
+# Investment + Dispatch LP
+# ============================================================
 def solve_investment_dispatch_lp(
-    tech_params_path: str,
-    load_curve_file: str,
-    dispatch_profiles_path: str,
-    ev_profile_path: str,
-    ev_max_mw: float = 0.0,
-    hydro_import_cap_mw: float = 5000.0,          # UI value: max imports (MW) each hour]
-    crf = None,
-    import_penalty_per_mwh: float = 200.0,        # autonomy penalty added ONLY in optimization objective
-    hours_of_storage: float = 4.0,
-    peak_hours: Tuple[int, int] = (16, 22),       # DSM allowed in [start, end) -> 16..21
-    discount_rate: float = 0.07,                  # for CRF
-    asset_life_years: float = 25.0,               # for CRF
-    capex_daily_divisor: float = 365.0,           # annual -> daily scaling
-    verbose: bool = True,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    tech_df: pd.DataFrame,
+    load_df: pd.DataFrame,
+    ev_profile: pd.DataFrame,
+    availability_df: pd.DataFrame,
+    max_ev_load_mw: float,
+    discount_rate: float,
+    *,
+    td_full_savings_frac: float = 0.10,          # e.g. 10% of gross load at "full build"
+    hydro_backstop_limit_mw: float = 10000.0,    # max dispatch per hour
+    lifetime_years: int = 20,
+):
     """
-    Joint capacity + dispatch optimization (single LP), with Backstop Imports.
+    Clean reference formulation (1-hour slices):
 
-    Key behavior:
-      - NO "unserved" slack variable exists.
-      - Any shortfall must be met by backstop imports, capped by hydro_import_cap_mw each hour.
+    SUPPLY:
+      - All supply gen limited by cap[tech] * availability[tech,h]
+      - Net Metering tied to Solar availability (behind-the-meter PV)
 
-    Decision variables:
-      - Cap_MW[tech] for local Supply/DSM/Storage power capacity
-      - Gen_MW[tech,h] for local supply dispatch
-      - DSM_MW[tech,h] for demand-side reductions (treated as MWh saved)
-      - Charge/Discharge/SOC for storage
-      - Import_MW[h] for backstop imports, 0 <= Import_MW[h] <= hydro_import_cap_mw
+    T&D:
+      - Not dispatched as generation.
+      - Reduces net load proportionally to gross load:
+          savings[h] = (cap_TD / TD_cap_limit) * td_full_savings_frac * gross_load[h]
+      - Report:
+          Load (gross), Load (net of T&D), T&D Savings
 
-    Objective (daily):
-      min  Sum_tech (Capex_$/kW * 1000 * Cap_MW * (CRF/365))
-         + Sum_{tech,h} (Var_Cost_$/MWh * dispatch_MWh)
-         + Sum_h ( (Import_Price + import_penalty_per_mwh) * Import_MW[h] )
+    FLEX (Balancing / Smart Grid):
+      - Battery, Pumped Storage: charge/discharge + SOC, eta=0.9 on discharge
+      - Smart Grid: modeled as balancing (Up/Down), eta=1.0
+      - SOC start/end = 0, SOC <= cap (cap is energy capacity since dt=1h)
+      - Optional daily throughput budget for Demand-side based on Load_Reduction_MW * 24
 
-    Notes:
-      - Imported Hydro is treated as a backstop purchase, not an "investment".
-      - Import_Price is read from tech_parameters.csv Var_Cost_$/MWh for "Imported Hydro".
-      - If the model cannot meet load within the import cap, it will become infeasible (as intended).
+    HYDRO:
+      - Imported Hydro investment fixed at 0 (cap upBound = 0)
+      - Dispatch allowed up to hydro_backstop_limit_mw (backstop)
     """
 
-    # ----------------------------
-    # Robust paths
-    # ----------------------------
-    here = os.path.dirname(__file__)
-    project_root = os.path.abspath(os.path.join(here, ".."))
+    # -----------------------------
+    # basic time index
+    # -----------------------------
+    hours = load_df["Hour"].astype(int).tolist()
+    H = len(hours)
 
-    tech_path = os.path.abspath(os.path.join(project_root, tech_params_path))
-    load_path = os.path.abspath(os.path.join(project_root, load_curve_file))
-    prof_path = os.path.abspath(os.path.join(project_root, dispatch_profiles_path))
-    evp_path = os.path.abspath(os.path.join(project_root, ev_profile_path))
-
-    tech = _clean_cols(pd.read_csv(tech_path))
-    load = _clean_cols(pd.read_csv(load_path))
-    prof = _clean_cols(pd.read_csv(prof_path))
-    evp = _clean_cols(pd.read_csv(evp_path))
-
-    # ----------------------------
-    # Input checks / normalization
-    # ----------------------------
-    if "Technology" not in tech.columns:
-        raise ValueError("tech_parameters.csv must include a 'Technology' column")
-
-    if "Load_MW" not in load.columns:
-        raise ValueError(f"Load file must include Load_MW. Found: {list(load.columns)}")
-    if "Hour" not in load.columns:
-        load["Hour"] = range(len(load))
-
-    if "Hour" not in evp.columns or "EV_Profile" not in evp.columns:
-        raise ValueError(f"EV profile must include Hour and EV_Profile. Found: {list(evp.columns)}")
-
-    # Ensure expected tech columns exist
-    expected_cols = [
-        "Capex_$/kW",
-        "Var_Cost_$/MWh",
-        "GHG_Reduction_tCO2_per_MWh",
-        "Reliability_Score",
-        "Capacity_Limit_MW",
-        "Load_Reduction_MW",
-        "Dispatchability",
-    ]
-    for c in expected_cols:
-        if c not in tech.columns:
-            tech[c] = 0.0
-
-    tech["Technology"] = tech["Technology"].astype(str).str.strip()
-    tech["Dispatchability"] = tech["Dispatchability"].astype(str).str.strip()
-
-    for c in [
-        "Capex_$/kW",
-        "Var_Cost_$/MWh",
-        "Capacity_Limit_MW",
-        "Load_Reduction_MW",
-        "GHG_Reduction_tCO2_per_MWh",
-        "Reliability_Score",
-    ]:
-        tech[c] = pd.to_numeric(tech[c], errors="coerce").fillna(0.0)
-
-    hours: List[int] = list(load["Hour"])
-    demand = load["Load_MW"].to_numpy(dtype=float)
-
-    ev_max_mw = float(ev_max_mw)
-    evp = evp.set_index("Hour").reindex(hours).fillna(0.0)
-    ev_profile = evp["EV_Profile"].to_numpy(dtype=float)
-
-    ev_mw = ev_max_mw * ev_profile
-    net_load = demand + ev_mw
-
-    # ----------------------------
-    # Tech maps + sets
-    # ----------------------------
-    disp = tech.set_index("Technology")["Dispatchability"].to_dict()
-    capex_kw = tech.set_index("Technology")["Capex_$/kW"].to_dict()
-    var_cost = tech.set_index("Technology")["Var_Cost_$/MWh"].to_dict()
-    cap_limit = tech.set_index("Technology")["Capacity_Limit_MW"].to_dict()
-    load_red_limit = tech.set_index("Technology")["Load_Reduction_MW"].to_dict()
-    ghg_rate = tech.set_index("Technology")["GHG_Reduction_tCO2_per_MWh"].to_dict()
-    rel_score = tech.set_index("Technology")["Reliability_Score"].to_dict()
-
-    all_techs = list(tech["Technology"].unique())
-
-    # Local supply techs EXCLUDING Imported Hydro (imports handled separately)
-    local_supply_techs = [
-        t for t in all_techs
-        if disp.get(t) in ["Non-dispatchable", "Dispatchable"] and t != "Imported Hydro"
-    ]
-    dsm_techs = [t for t in all_techs if disp.get(t) == "Demand-side"]
-    storage_techs = [t for t in all_techs if disp.get(t) == "Balancing"]
-
-    import_price = float(var_cost.get("Imported Hydro", 0.0))  # "normal hydro price" for reporting
-
-    if verbose:
-        print("DEBUG local_supply_techs:", local_supply_techs)
-        print("DEBUG dsm_techs:", dsm_techs)
-        print("DEBUG storage_techs:", storage_techs)
-        print("DEBUG import_price ($/MWh):", import_price)
-        print("DEBUG import_penalty_per_mwh ($/MWh):", float(import_penalty_per_mwh))
-        print("DEBUG hydro_import_cap_mw (MW):", float(hydro_import_cap_mw))
-
-    # ----------------------------
-    # Availability profiles
-    # ----------------------------
-    availability_mapping: Dict[str, str] = {
-        "Solar PV": "Solar PV",
-        "Wind": "Wind",
-        # Treat net metering like solar by default if you want it tied to solar profile:
-        "Net Metering": "Solar PV",
-    }
-
-    def availability_factor(tech_name: str, hour: int) -> float:
-        col = availability_mapping.get(tech_name)
-        if not col or col not in prof.columns:
-            return 1.0
-        if "Hour" not in prof.columns:
-            return 1.0
-        row = prof.loc[prof["Hour"] == hour, col]
-        return 1.0 if row.empty else float(row.iloc[0])
-
-    # ----------------------------
-    # Daily capex factor (Option 1)
-    # ----------------------------
-    crf = _capital_recovery_factor(discount_rate, asset_life_years)
-    capex_daily_factor = float(crf) / float(capex_daily_divisor)
-
-    if verbose:
-        print("DEBUG CRF:", float(crf), "capex_daily_factor:", float(capex_daily_factor))
-
-    # ----------------------------
-    # Build model
-    # ----------------------------
-    model = LpProblem("Investment_and_Dispatch", LpMinimize)
-
-    def vname(prefix: str, tech_name: str, h: Optional[int] = None) -> str:
-        base = tech_name.replace(" ", "_").replace("-", "_")
-        return f"{prefix}_{base}" if h is None else f"{prefix}_{base}_{h}"
-
-    # Capacity decision variables (MW)
-    cap_mw: Dict[str, LpVariable] = {}
-
-    # Local supply capacities
-    for t in local_supply_techs:
-        cap_mw[t] = LpVariable(
-            vname("CapMW", t),
-            lowBound=0,
-            upBound=float(cap_limit.get(t, 0.0)),
-        )
-
-    # DSM capacities (use Load_Reduction_MW if present, else fallback to capacity limit)
-    for t in dsm_techs:
-        ub = float(load_red_limit.get(t, 0.0))
-        if ub <= 0:
-            ub = float(cap_limit.get(t, 0.0))
-        cap_mw[t] = LpVariable(vname("CapMW", t), lowBound=0, upBound=ub)
-
-    # Storage power capacities
-    for s in storage_techs:
-        cap_mw[s] = LpVariable(
-            vname("CapMW", s),
-            lowBound=0,
-            upBound=float(cap_limit.get(s, 0.0)),
-        )
-
-    # Dispatch variables (MW == MWh over 1 hour)
-    gen = {(t, h): LpVariable(vname("Gen", t, h), lowBound=0) for t in local_supply_techs for h in hours}
-    dsm = {(t, h): LpVariable(vname("DSM", t, h), lowBound=0) for t in dsm_techs for h in hours}
-
-    charge = {(s, h): LpVariable(vname("Chg", s, h), lowBound=0) for s in storage_techs for h in hours}
-    discharge = {(s, h): LpVariable(vname("Dis", s, h), lowBound=0) for s in storage_techs for h in hours}
-    soc = {(s, h): LpVariable(vname("SOC", s, h), lowBound=0) for s in storage_techs for h in hours}
-
-    # Backstop imports (Imported Hydro), capped by UI each hour
-    imports = {
-        h: LpVariable(vname("Import", "Hydro", h), lowBound=0, upBound=float(hydro_import_cap_mw))
+    gross_load = dict(zip(load_df["Hour"].astype(int), load_df["Load_MW"]))
+    ev_load = {
+        h: float(max_ev_load_mw)
+        * float(ev_profile.loc[ev_profile["Hour"].astype(int) == h, "EV_Profile"].iloc[0])
         for h in hours
     }
 
-    # ----------------------------
-    # Constraints
-    # ----------------------------
+    # -----------------------------
+    # normalize discount rate
+    # -----------------------------
+    r = float(discount_rate)
+    if r > 1.0:
+        r = r / 100.0
 
-    # Local supply availability/capacity
-    for t in local_supply_techs:
-        for h in hours:
-            model += gen[(t, h)] <= cap_mw[t] * availability_factor(t, h)
+    if r <= 0:
+        crf = 1.0 / float(lifetime_years)
+    else:
+        crf = (r * (1 + r) ** lifetime_years) / ((1 + r) ** lifetime_years - 1)
+    capex_daily_factor = crf / 365.0
 
-    # DSM + peak-only restriction
-    peak_start, peak_end = int(peak_hours[0]), int(peak_hours[1])
-    peak_set = set(range(peak_start, peak_end))
+    # -----------------------------
+    # availability lookup
+    # -----------------------------
+    # Expect availability_df: Hour, Technology, Availability
+    avail = {
+        (_norm(row["Technology"]), int(row["Hour"])): float(row["Availability"])
+        for _, row in availability_df.iterrows()
+    }
 
-    for t in dsm_techs:
-        for h in hours:
-            model += dsm[(t, h)] <= cap_mw[t]
-            if h not in peak_set:
-                model += dsm[(t, h)] == 0
+    def get_avail(tech_name: str, h: int) -> float:
+        """
+        Returns availability for a technology at hour h.
+        Default 1.0 if missing.
 
-    # Storage (SOC start/end = 0, SOC bounds from power * hours_of_storage)
-    eta_c, eta_d = 0.95, 0.95
+        Special rule: Net Metering uses Solar availability.
+        """
+        tkey = _norm(tech_name)
 
-    for s in storage_techs:
-        power_cap = cap_mw[s]
-        energy_cap = power_cap * float(hours_of_storage)
+        if tkey in ("Net_Metering", "NetMetering", "Net_Metering_PV"):
+            # force behind-the-meter solar shape
+            solar_key = "Solar_PV"
+            return float(avail.get((solar_key, int(h)), 1.0))
 
-        for h in hours:
-            model += charge[(s, h)] <= power_cap
-            model += discharge[(s, h)] <= power_cap
-            model += soc[(s, h)] <= energy_cap
+        return float(avail.get((tkey, int(h)), 1.0))
 
-        # Pin start/end
-        model += soc[(s, hours[0])] == 0
-        model += soc[(s, hours[-1])] == 0
+    # -----------------------------
+    # identify technology buckets
+    # -----------------------------
+    tech_df = tech_df.copy()
+    tech_df["Technology"] = tech_df["Technology"].astype(str)
 
-        # SOC dynamics for ALL hours (including hour 0, wrapping from last hour)
-        for idx, h in enumerate(hours):
-            prev_h = hours[idx - 1]  # wraps: idx=0 -> prev_h = last hour
-            model += (
-                soc[(s, h)]
-                == soc[(s, prev_h)]
-                + eta_c * charge[(s, h)]
-                - (1.0 / eta_d) * discharge[(s, h)]
-            )
+    # Special names (match your CSV labels)
+    TD_NAME = "T&D Upgrades"
+    HYDRO_NAME = "Imported Hydro"
+    SMART_NAME = "Smart Grid"
 
+    # helper flags
+    tech_df["DSM_Mode"] = tech_df["DSM_Mode"] if "DSM_Mode" in tech_df.columns else "0"
 
-    # Load balance: imports cover remaining shortfall (within cap)
-    for idx, h in enumerate(hours):
-        supply_terms = lpSum(gen[(t, h)] for t in local_supply_techs)
-        dsm_terms = lpSum(dsm[(t, h)] for t in dsm_techs)
-        dis_terms = lpSum(discharge[(s, h)] for s in storage_techs)
-        chg_terms = lpSum(charge[(s, h)] for s in storage_techs)
+    # Supply generation technologies (exclude T&D, exclude hydro-as-backstop)
+    supply_techs = tech_df.query(
+        "Dispatchability in ['Non-dispatchable','Dispatchable']"
+    ).copy()
+    supply_techs = supply_techs[~supply_techs["Technology"].isin([TD_NAME, HYDRO_NAME])].copy()
 
-        model += (
-            supply_terms + dsm_terms + dis_terms - chg_terms + imports[h]
-            == float(net_load[idx])
+    # Balancing storage
+    storage_techs = tech_df.query("Dispatchability == 'Balancing'").copy()
+
+    # Smart Grid as balancing DSM (if present)
+    smart_grid_techs = tech_df[tech_df["Technology"] == SMART_NAME].copy()
+
+    # T&D tech row (if present)
+    td_row = tech_df[tech_df["Technology"] == TD_NAME].copy()
+
+    # Hydro row (if present)
+    hydro_row = tech_df[tech_df["Technology"] == HYDRO_NAME].copy()
+
+    # Flex techs that will get charge/discharge/SOC:
+    # - storage techs (Balancing)
+    # - smart grid (balancing-like)
+    flex_techs = pd.concat([storage_techs, smart_grid_techs], axis=0)
+    flex_techs = flex_techs.drop_duplicates(subset=["Technology"]).copy()
+
+    # efficiency on discharge: storage 0.9, smart grid 1.0
+    eta = {}
+    for _, t in flex_techs.iterrows():
+        if t["Dispatchability"] == "Balancing":
+            eta[t["Technology"]] = 0.90
+        else:
+            eta[t["Technology"]] = 1.00
+    inv_eta = {k: (1.0 / v) for k, v in eta.items()}  # constant multipliers
+
+    # -----------------------------
+    # LP
+    # -----------------------------
+    prob = LpProblem("Investment_Dispatch", LpMinimize)
+
+    # capacity decision vars (MW == MWh due to 1h slices) for all techs
+    cap = {
+        t["Technology"]: LpVariable(
+            f"Cap_{_norm(t['Technology'])}",
+            lowBound=0,
+            upBound=_as_float(t.get("Capacity_Limit_MW", 0.0), 0.0)
         )
+        for _, t in tech_df.iterrows()
+    }
 
-    # ----------------------------
-    # Objective (Option 1)
-    # ----------------------------
-    capex_term = lpSum(
-        float(capex_kw.get(t, 0.0)) * 1000.0 * cap_mw[t] * capex_daily_factor
-        for t in cap_mw.keys()
+    # Force hydro investment to 0
+    if HYDRO_NAME in cap:
+        cap[HYDRO_NAME].upBound = 0.0
+
+    # Supply generation vars
+    gen = {
+        (t["Technology"], h): LpVariable(f"G_{_norm(t['Technology'])}_{h}", lowBound=0)
+        for _, t in supply_techs.iterrows()
+        for h in hours
+    }
+
+    # Hydro dispatch var (dispatch-only backstop)
+    hydro_gen = {
+        h: LpVariable(f"G_{_norm(HYDRO_NAME)}_{h}", lowBound=0)
+        for h in hours
+    } if HYDRO_NAME in tech_df["Technology"].values else {}
+
+    # Flex vars: charge/discharge and SOC
+    charge = {
+        (t["Technology"], h): LpVariable(f"Ch_{_norm(t['Technology'])}_{h}", lowBound=0)
+        for _, t in flex_techs.iterrows()
+        for h in hours
+    }
+    discharge = {
+        (t["Technology"], h): LpVariable(f"Dis_{_norm(t['Technology'])}_{h}", lowBound=0)
+        for _, t in flex_techs.iterrows()
+        for h in hours
+    }
+    # SOC indexed by step i = 0..H
+    soc = {
+        (t["Technology"], i): LpVariable(f"SOC_{_norm(t['Technology'])}_{i}", lowBound=0)
+        for _, t in flex_techs.iterrows()
+        for i in range(H + 1)
+    }
+
+    # -----------------------------
+    # T&D savings definition
+    # -----------------------------
+    # savings[h] = scale * td_full_savings_frac * gross_load[h]
+    # where scale = cap_TD / TD_cap_limit (0..1)
+    td_savings = {h: 0.0 for h in hours}
+    td_scale_var = None
+
+    if not td_row.empty:
+        td_cap_limit = float(td_row["Capacity_Limit_MW"].iloc[0]) if "Capacity_Limit_MW" in td_row.columns else 0.0
+        if td_cap_limit > 0 and TD_NAME in cap:
+            td_scale_var = LpVariable("TD_Scale", lowBound=0, upBound=1)
+            # tie scale to investment: cap_TD = scale * limit
+            prob += cap[TD_NAME] == td_scale_var * td_cap_limit, "TD_scale_link"
+        else:
+            # if limit missing or zero, treat as no effect
+            td_scale_var = None
+
+    # -----------------------------
+    # Hourly balance constraints
+    # -----------------------------
+    for h in hours:
+        gross = float(gross_load[h])
+        # savings at hour h is an expression if td_scale_var exists, else 0
+        if td_scale_var is not None:
+            savings_expr = td_scale_var * td_full_savings_frac * gross
+        else:
+            savings_expr = 0.0
+
+        net_load_expr = gross - savings_expr
+
+        prob += (
+            # Supply generation
+            lpSum(gen[(t["Technology"], h)] for _, t in supply_techs.iterrows())
+            # Hydro backstop
+            + (hydro_gen[h] if h in hydro_gen else 0.0)
+            # Flex discharge reduces need
+            + lpSum(discharge[(t["Technology"], h)] for _, t in flex_techs.iterrows())
+            ==
+            # Net load after T&D
+            net_load_expr
+            # EV adds load
+            + float(ev_load[h])
+            # Flex charging adds load
+            + lpSum(charge[(t["Technology"], h)] for _, t in flex_techs.iterrows())
+        ), f"PowerBalance_{h}"
+
+    # -----------------------------
+    # Supply availability limits
+    # -----------------------------
+    for _, t in supply_techs.iterrows():
+        tech = t["Technology"]
+        for h in hours:
+            a = get_avail(tech, h)
+            prob += gen[(tech, h)] <= cap[tech] * a, f"Avail_{_norm(tech)}_{h}"
+
+    # Hydro dispatch limits
+    if hydro_gen:
+        for h in hours:
+            prob += hydro_gen[h] <= float(hydro_backstop_limit_mw), f"HydroBackstop_{h}"
+
+    # -----------------------------
+    # Flex constraints (storage + smart grid)
+    # -----------------------------
+    for _, t in flex_techs.iterrows():
+        tech = t["Technology"]
+
+        # SOC start/end
+        prob += soc[(tech, 0)] == 0, f"SOC_start_{_norm(tech)}"
+        prob += soc[(tech, H)] == 0, f"SOC_end_{_norm(tech)}"
+
+        # SOC dynamics + bounds
+        for i, h in enumerate(hours):
+            prob += (
+                soc[(tech, i + 1)]
+                ==
+                soc[(tech, i)]
+                + charge[(tech, h)]
+                - discharge[(tech, h)] * inv_eta[tech]   # linear (mult by constant)
+            ), f"SOC_dyn_{_norm(tech)}_{h}"
+
+            # bounds
+            prob += soc[(tech, i)] <= cap[tech], f"SOC_cap_{_norm(tech)}_{h}"
+            prob += charge[(tech, h)] <= cap[tech], f"Ch_cap_{_norm(tech)}_{h}"
+            prob += discharge[(tech, h)] <= cap[tech], f"Dis_cap_{_norm(tech)}_{h}"
+
+        # optional daily throughput cap for Smart Grid using Load_Reduction_MW
+        if tech == SMART_NAME and "Load_Reduction_MW" in tech_df.columns:
+            lr = float(tech_df.loc[tech_df["Technology"] == tech, "Load_Reduction_MW"].iloc[0])
+            if lr > 0:
+                daily_budget = lr * 24.0
+                prob += lpSum(charge[(tech, h)] for h in hours) <= daily_budget, f"SG_daily_budget_ch_{_norm(tech)}"
+                prob += lpSum(discharge[(tech, h)] for h in hours) <= daily_budget, f"SG_daily_budget_dis_{_norm(tech)}"
+
+    # -----------------------------
+    # Objective: daily capex + variable cost on supply + hydro
+    # -----------------------------
+    capex_cost = lpSum(
+        cap[t["Technology"]] * float(t["Capex_$/kW"]) * 1000.0 * capex_daily_factor
+        for _, t in tech_df.iterrows()
+        # (hydro cap is fixed 0 anyway; safe)
     )
 
-    var_term = lpSum(
-        gen[(t, h)] * float(var_cost.get(t, 0.0))
-        for t in local_supply_techs
+    # variable costs:
+    # - supply techs use Var_Cost_$/MWh
+    # - hydro uses Var_Cost_$/MWh if present in tech_df, else 0
+    var_cost_supply = lpSum(
+        gen[(t["Technology"], h)] * float(t["Var_Cost_$/MWh"])
+        for _, t in supply_techs.iterrows()
         for h in hours
     )
 
-    var_term += lpSum(
-        dsm[(t, h)] * float(var_cost.get(t, 0.0))
-        for t in dsm_techs
-        for h in hours
-    )
+    hydro_var = 0.0
+    if hydro_gen:
+        if not hydro_row.empty and "Var_Cost_$/MWh" in hydro_row.columns:
+            hydro_v = float(hydro_row["Var_Cost_$/MWh"].iloc[0])
+        else:
+            hydro_v = 0.0
+        hydro_var = lpSum(hydro_gen[h] * hydro_v for h in hours)
 
-    # Storage variable cost applied to discharge MWh (your preference)
-    var_term += lpSum(
-        discharge[(s, h)] * float(var_cost.get(s, 0.0))
-        for s in storage_techs
-        for h in hours
-    )
+    prob += capex_cost + var_cost_supply + hydro_var
 
-    # Imports: normal price + penalty (penalty enforces autonomy in optimization only)
-    imports_term = lpSum(
-        imports[h] * float(import_price + float(import_penalty_per_mwh))
-        for h in hours
-    )
-
-    model += capex_term + var_term + imports_term
-
-    # ----------------------------
+    # -----------------------------
     # Solve
-    # ----------------------------
-    model.solve()
-    if LpStatus[model.status] != "Optimal":
-        raise RuntimeError(f"Investment+Dispatch LP not optimal. Status={LpStatus[model.status]}")
+    # -----------------------------
+    prob.solve()
+    print("DEBUG Status:", LpStatus[prob.status])
+    print("DEBUG Objective:", value(prob.objective))
 
-    # ----------------------------
-    # Build outputs
-    # ----------------------------
-
-    # Investment summary
-    cap_rows = []
-    for t in all_techs:
-        dtype = disp.get(t, "")
-
-        # Imported Hydro is not an invested asset (it's an import option)
-        inv_mw = 0.0
-        if t in cap_mw:
-            inv_mw = float(cap_mw[t].varValue or 0.0)
-
-        cap_rows.append(
-            {
-                "Technology": t,
-                "Dispatchability": dtype,
-                "Investment_MW": float(inv_mw),
-                "Capex_$/kW": float(capex_kw.get(t, 0.0)),
-                "Var_Cost_$/MWh": float(var_cost.get(t, 0.0)),
-                "GHG_Reduction_tCO2_per_MWh": float(ghg_rate.get(t, 0.0)),
-                "Reliability_Score": float(rel_score.get(t, 0.0)),
-            }
-        )
-    inv_df = pd.DataFrame(cap_rows)
-
-    # Dispatch time series
+    # -----------------------------
+    # Build dispatch_df (matches your UI stacking convention)
+    # -----------------------------
+    # Convention:
+    #   Positive = supply/discharge + "Down" type effects (incl. T&D savings)
+    #   Negative = EV + charging + "Up" type effects
+    # Here:
+    #   - Storage charge is negative, discharge positive
+    #   - Smart Grid Down = discharge (positive), Smart Grid Up = charge (negative)
+    #   - EV is negative
+    #   - T&D Savings is positive
     rows = []
-    for idx, h in enumerate(hours):
-        row = {
+    balance_residual = []
+
+    # Compute realized T&D savings for output (post-solve)
+    td_cap_limit = None
+    if not td_row.empty and "Capacity_Limit_MW" in td_row.columns:
+        td_cap_limit = float(td_row["Capacity_Limit_MW"].iloc[0])
+
+    td_cap_val = float(cap[TD_NAME].varValue or 0.0) if (TD_NAME in cap) else 0.0
+    td_scale_val = (td_cap_val / td_cap_limit) if (td_cap_limit and td_cap_limit > 0) else 0.0
+
+    for h in hours:
+        gross = float(gross_load[h])
+        savings = td_scale_val * td_full_savings_frac * gross
+        net = gross - savings
+
+        r = {
             "Hour": int(h),
-            "Load_MW": float(demand[idx]),
-            "EV_MW": float(ev_mw[idx]),
-            "Net_Load_MW": float(net_load[idx]),
-            # expose imports as Imported Hydro in the time series
-            "Imported Hydro": float(imports[h].varValue or 0.0),
+            "Load (gross)": gross,
+            "Load (net of T&D)": net,
+            "T&D Savings": savings,
+            "EV Charging": -float(ev_load[h]),
         }
 
-        for t in local_supply_techs:
-            row[t] = float(gen[(t, h)].varValue or 0.0)
-        for t in dsm_techs:
-            row[t] = float(dsm[(t, h)].varValue or 0.0)
-        for s in storage_techs:
-            row[f"{s} Charge"] = float(charge[(s, h)].varValue or 0.0)
-            row[f"{s} Discharge"] = float(discharge[(s, h)].varValue or 0.0)
-            row[f"{s} SOC"] = float(soc[(s, h)].varValue or 0.0)
+        # supply techs
+        for _, t in supply_techs.iterrows():
+            tech = t["Technology"]
+            r[tech] = float(gen[(tech, h)].varValue or 0.0)
 
-        rows.append(row)
+        # hydro dispatch
+        if hydro_gen:
+            r[HYDRO_NAME] = float(hydro_gen[h].varValue or 0.0)
 
-    disp_df = pd.DataFrame(rows)
+        # storage techs (explicit names)
+        for _, t in storage_techs.iterrows():
+            tech = t["Technology"]
+            r[f"{tech} Discharge"] = float(discharge[(tech, h)].varValue or 0.0)
+            r[f"{tech} Charge"] = -float(charge[(tech, h)].varValue or 0.0)
 
-    # ----------------------------
-    # Terminal totals (Daily MWh)
-    # ----------------------------
-    if verbose:
-        supply_cols = [c for c in ["Solar PV", "Wind", "Net Metering", "T&D Upgrades", "Imported Hydro"] if c in disp_df.columns]
-        dsm_cols = [c for c in ["Time-of-Day Pricing", "Smart Grid"] if c in disp_df.columns]
-        storage_dis_cols = [c for c in ["Battery Storage Discharge", "Pumped Storage Discharge"] if c in disp_df.columns]
-        storage_chg_cols = [c for c in ["Battery Storage Charge", "Pumped Storage Charge"] if c in disp_df.columns]
-        ev_col = "EV_MW" if "EV_MW" in disp_df.columns else None
+        # smart grid as balancing up/down
+        if not smart_grid_techs.empty:
+            tech = SMART_NAME
+            r[f"{tech} Down"] = float(discharge[(tech, h)].varValue or 0.0)
+            r[f"{tech} Up"] = -float(charge[(tech, h)].varValue or 0.0)
 
-        totals = {
-            "Total Generation (MWh)": float(disp_df[supply_cols].sum().sum()) if supply_cols else 0.0,
-            "Total DSM (MWh saved)": float(disp_df[dsm_cols].sum().sum()) if dsm_cols else 0.0,
-            "Total Storage Charging (MWh)": float(disp_df[storage_chg_cols].sum().sum()) if storage_chg_cols else 0.0,
-            "Total Storage Discharging (MWh)": float(disp_df[storage_dis_cols].sum().sum()) if storage_dis_cols else 0.0,
-            "Total EV Charging (MWh)": float(disp_df[ev_col].sum()) if ev_col else 0.0,
-            "Total Imported Hydro (MWh)": float(disp_df["Imported Hydro"].sum()) if "Imported Hydro" in disp_df.columns else 0.0,
-            "Max Imported Hydro (MW)": float(disp_df["Imported Hydro"].max()) if "Imported Hydro" in disp_df.columns else 0.0,
-        }
+        # residual check (should be ~0)
+        lhs = 0.0
+        rhs = 0.0
 
-        print("\n=== DISPATCH TOTALS (Daily MWh) ===")
-        print(pd.DataFrame({"Metric": totals.keys(), "MWh": totals.values()}).to_string(index=False))
-        print("==================================\n")
+        # lhs: supply + hydro + discharges
+        lhs += sum(float(r.get(t["Technology"], 0.0)) for _, t in supply_techs.iterrows())
+        if hydro_gen:
+            lhs += float(r.get(HYDRO_NAME, 0.0))
+        lhs += sum(float(r.get(f"{t['Technology']} Discharge", 0.0)) for _, t in storage_techs.iterrows())
+        if not smart_grid_techs.empty:
+            lhs += float(r.get(f"{SMART_NAME} Down", 0.0))
 
-    return inv_df, disp_df
+        # rhs: net load + EV + charges
+        rhs += net
+        rhs += float(ev_load[h])
+        rhs += sum(-float(r.get(f"{t['Technology']} Charge", 0.0)) for _, t in storage_techs.iterrows())  # remove neg sign
+        if not smart_grid_techs.empty:
+            rhs += -float(r.get(f"{SMART_NAME} Up", 0.0))  # remove neg sign
 
+        balance_residual.append((h, lhs - rhs))
+
+        rows.append(r)
+
+    dispatch_df = pd.DataFrame(rows)
+
+    # -----------------------------
+    # Investment output (NO Daily_Capex column)
+    # -----------------------------
+    inv_rows = []
+    for _, t in tech_df.iterrows():
+        tech = t["Technology"]
+        mw = float(cap[tech].varValue or 0.0) if tech in cap else 0.0
+
+        # Force hydro investment to 0 in output
+        if tech == HYDRO_NAME:
+            mw = 0.0
+
+        inv_rows.append({
+            "Technology": tech,
+            "Investment_MW": mw,
+            "Upfront_Capex_$": mw * float(t["Capex_$/kW"]) * 1000.0,
+        })
+    investment_df = pd.DataFrame(inv_rows)
+
+    # -----------------------------
+    # Diagnostics: totals + residual check
+    # -----------------------------
+    print("\n=== TOTAL DISPATCH BY COLUMN (Daily MWh) ===")
+    cols = [c for c in dispatch_df.columns if c != "Hour"]
+    totals = dispatch_df[cols].sum(numeric_only=True)
+
+    summary_tbl = (
+        totals.rename("Total_MWh")
+        .reset_index()
+        .rename(columns={"index": "Series"})
+    )
+    summary_tbl["Abs_MWh"] = summary_tbl["Total_MWh"].abs()
+    summary_tbl = summary_tbl.sort_values("Abs_MWh", ascending=False).drop(columns=["Abs_MWh"])
+
+    pd.set_option("display.max_rows", 250)
+    pd.set_option("display.width", 160)
+    print(summary_tbl.to_string(index=False, formatters={"Total_MWh": "{:,.2f}".format}))
+    print("===========================================\n")
+
+    # residual report
+    res_df = pd.DataFrame(balance_residual, columns=["Hour", "Residual_MW"])
+    worst = float(res_df["Residual_MW"].abs().max()) if not res_df.empty else 0.0
+    print("=== BALANCE RESIDUAL CHECK (should be ~0) ===")
+    print(res_df.to_string(index=False, formatters={"Residual_MW": "{:,.6f}".format}))
+    print("Max abs residual:", f"{worst:,.6f}")
+    print("===========================================\n")
+
+    # availability coverage check (helps catch name mismatches)
+    print("=== AVAILABILITY COVERAGE CHECK ===")
+    for tech in supply_techs["Technology"].unique():
+        missing = [h for h in hours if (_norm(tech), int(h)) not in avail]
+        # note: Net Metering is special-cased to solar, so we don't treat it as "missing"
+        if _norm(tech) == "Net_Metering":
+            print("INFO: Net Metering availability tied to Solar PV (forced).")
+            continue
+        if missing:
+            print(f"WARNING: {tech} missing availability for {len(missing)}/24 hours. Default=1.0 for missing.")
+        else:
+            print(f"OK: {tech} has availability for all 24 hours.")
+    print("===================================\n")
+
+    return investment_df, dispatch_df

@@ -1,224 +1,156 @@
-# 📈 Utility Investment Optimization & Dispatch Model — Shiny for Python
+# Investment Optimization Dashboard — Supply, Storage & Demand-Side Planning
 
-Multi-season optimization model for evaluating utility-scale investments in solar, wind, net metering, battery storage, and pumped hydro — with an integrated daily dispatch LP.
+[![Python](https://img.shields.io/badge/Python-3.9+-blue)]() [![Shiny for Python](https://img.shields.io/badge/Shiny-Python-blueviolet)]() [![License: MIT](https://img.shields.io/badge/License-MIT-green)]() [![Status](https://img.shields.io/badge/Status-Active-brightgreen)]()
 
-This project combines capacity planning and hourly dispatch modelling into a single analytical tool, designed for utility planners and energy consultants evaluating investment pathways under cost, GHG, and reliability objectives.
 
-🚀 Live Demo (GIF to be added)
+An interactive Shiny for Python application for investment and dispatch optimization in electric power systems, combining generation, storage, demand-side resources, and backstop imports into a transparent planning framework.
 
-📌 A 5–12 second GIF should go here showing:
+## 🚀 Live Demo
 
-Selecting objective type
+https://tonympeluso.shinyapps.io/investment_optimization/
 
-Running the optimization
+(link placeholder — update once deployed)
 
-Viewing investment table + supply stack chart
+## 🌍 Overview
 
-Navigating to the dispatch tab
+Electric utilities increasingly need transparent, explainable planning tools that bridge the gap between:
+- long-term investment decisions
+- hourly dispatch realities
+- demand-side and non-wires alternatives
+- climate and decarbonization objectives
 
-(We will generate this once the dashboard is live.)
+This project implements a daily investment + dispatch optimization model, wrapped in an interactive Shiny UI, allowing planners and analysts to explore:
+- how much capacity to build
+- which technologies enter the mix
+- how resources are dispatched hour-by-hour
+- how demand-side measures reshape load
+- cost and emissions tradeoffs
 
-## 🌍 Purpose & Use Cases
+The app emphasizes clarity over black-box complexity, making it suitable for:
+- utility planning teams
+- regulators and stakeholders
+- consultants and advisors
+- portfolio demonstrations
 
-Traditional long-term planning tools often evaluate technologies one by one or rely on static assumptions.
+## 🧩 Key Features
 
-This model solves two linked problems:
+### ⚙️ Investment Optimization
+- Capacity decision variables (MW) by technology
+- Capital recovery factor (CRF)–based cost treatment
+- Explicit backstop resource (Imported Hydro)
+- Upper bounds and technology constraints
 
-#### 1️⃣ Investment LP:
-Optimizes installed capacities of technologies under cost or GHG objectives.
+### ⚡ Hourly Dispatch Model
+- 24-hour dispatch with:
+    - variable renewable availability (solar, wind)
+    - balancing resources (battery, pumped hydro, smart grid)
+    - demand-side shifting (net-zero over the day)
+- Exact hourly power balance enforced
+-Net-load formulation with T&D efficiency improvements
 
-#### 2️⃣ Dispatch LP:
-Checks hourly feasibility across a 24-hour representative day for each season (winter, summer, fall, spring), ensuring that load is met and storage behaves correctly.
+### 📈 Outputs & Visualizations
+Investment Results
+- Capacity built (MW)
+- Proxy LCOE ($/MWh), calculated from:
+    - CRF-based capex
+    - utilization from actual dispatch
+    - variable operating costs
+- Supply Stack
+    - Cumulative capacity vs Proxy LCOE
+    - Technologies ordered by cost effectiveness
+    - Clear distinction between built capacity and utilization
+- Hourly Dispatch
+    - Positive / negative stacking convention
+    - Gross load vs net load (after T&D improvements)
+    - Storage charging/discharging and DSM shifts visualized explicitly
+- Abatement Curve
+    - Daily CO₂ abatement by technology
+    - Ordered by marginal cost of abatement
+    - Complements the supply stack for decarbonization analysis
 
-#### Real-world applications
+## 📊 Screenshots & Outputs
 
-Utility planners can use this tool to:
-- Build GHG-minimizing portfolios aligned with Net Zero objectives
-- Estimate optimal mix of solar / wind / net metering / storage
-- Evaluate cost trade-offs using LCOE-based or variable-cost objectives
-- Test sensitivity to discount rate and load growth scenarios
-- Visualize seasonal reliability constraints using dispatch plots
-- Produce GHG abatement cost curves for decision makers
+Investment Results & Supply Stack
+<img src="assets/PicTab1.png" width="750">
+Hourly Dispatch & Load Shaping
+<img src="assets/PicTab2.png" width="750">
+🔄 App Demo (GIF)
+<img src="assets/VideoDemo.gif" width="750">
 
-## 🧩 High-Level Architecture
-+-------------------------------------------------------------+
-|                   Investment Optimization LP                |
-|-------------------------------------------------------------|
-| Objective: Minimize Cost / Minimize GHG / Weighted Combo    |
-|                                                             |
-| Decision Variables:                                         |
-|   - Installed Capacity (MW) for each technology             |
-|                                                             |
-| Constraints:                                                |
-|   - Seasonal energy availability                            |
-|   - Capital cost budget (optional)                          |
-|   - Capacity factors (proxy or dispatch-based)              |
-+---------------------------+---------------------------------+
-                            |
-                            v
-+-------------------------------------------------------------+
-|                   Dispatch Optimization LP                  |
-|-------------------------------------------------------------|
-| Hourly simulation for selected season:                      |
-|  - Load balance (supply + discharge = load + charge)        |
-|  - Storage charging/discharging limits                      |
-|  - SOC continuity (SOC_end = SOC_start)                     |
-|  - Availability limits for solar, wind, net metering        |
-+-------------------------------------------------------------+
-                            |
-                            v
-+-------------------------------------------------------------+
-|                      Dashboard & Outputs                    |
-|-------------------------------------------------------------|
-|  - Investment summary table                                 |
-|  - Supply stack chart                                       |
-|  - GHG abatement curve                                      |
-|  - Seasonal dispatch plots                                  |
-|  - Scenario saving (JSON)                                   |
-+-------------------------------------------------------------+
-
-## 🔧 Optimization Model
-
-### Decision Variables
-
-##### Investment LP
-- CapTech[t] — Installed capacity (MW) for technology t
-(Solar_PV, Wind, Net_Metering, Battery_Storage, Pumped_Hydro)
-
-#### Dispatch LP
-- Dispatch[t, h] — Hourly output (MW)
-- Charge[t, h], Discharge[t, h] — For storage technologies
-- SOC[t, h] — State of charge
-
-### 🎯 Objective Functions
-
-Users select one of:
-
-#### 1. Cost Minimization
-
-Uses capital + variable cost streams:
+ ## 🗂️ Project Structure
 ```
-Minimize Σ(t) [CapitalCost[t] * CapTech[t] + 
-               Σ(h) VariableCost[t] * Dispatch[t,h]]
-```
-#### 2. GHG Minimization
-
-Minimizes tonnes of CO₂ displaced or emitted:
-```
-Minimize Σ(t) [GHGIntensity[t] * EnergyProduced[t]]
-```
-#### 3. Weighted Objective
-
-A convex combination:
-```
-Obj = α * Cost + (1 - α) * GHG
-```
-
-Where α is chosen with a slider in the UI.
-
-### 📏 Core Constraints
-
-#### Load Balance (per hour)
-```
-Σ_t Dispatch[t,h] + Discharge[h] = Load[h] + Charge[h]
-```
-#### Storage Constraints
-- Charge/discharge limits
-- Round-trip efficiency
-- SOC bounds
-- End-of-day SOC = start-of-day SOC (seasonal balance)
-
-#### Availability Limits
-```
-Dispatch[t,h] ≤ CapTech[t] * Availability[t,h]
-```
-
-#### Non-negativity and Capacity Bounds
-```
-CapTech[t] ≥ 0
-Dispatch[t,h] ≥ 0
-```
-
-## 📊 Dashboard Features
-
-### Investment Summary Table
-
-Shows optimized capacities, annual energy output, costs, and GHG effects.
-
-### Supply Stack Chart
-
-A clear, stacked bar visualization of optimized generation mix.
-
-### GHG Abatement Curve
-
-Plots incremental abatement vs incremental cost.
-
-### Seasonal Dispatch Plot
-
-For each season (winter/summer/fall/spring):
-- Solar + wind + net metering
-- Battery + pumped hydro charge/discharge (negative = charging)
-- Load curve overlay
-- Visual inspection of hourly reliability
-
-### Scenario Saving
-
-Outputs input assumptions + LP results to a JSON file.
-
-## 📸 Example Outputs (placeholders)
-
-Replace with images under /assets/:
-
-![Investment Summary](assets/invest_summary.png)
-![Supply Stack](assets/supply_stack.png)
-![GHG Abatement Curve](assets/ghg_abatement.png)
-![Winter Dispatch](assets/dispatch_winter.png)
-```
-🗂️ Project Structure
 investment_dashboard/
-├── app/
-│   └── app.py                      # Shiny UI + server
-├── solver/
-│   ├── solve_investment_lp.py      # Investment LP
-│   ├── solve_dispatch_lp.py        # Dispatch LP
-│   └── utils.py                    # Shared functions
+├── src/
+│ ├── investment_model.py        # Shiny UI + server
+│ ├── solve_investment_dispatch_lp.py  # LP solver (PuLP)
+│
 ├── data/
-│   ├── tech_parameters_split_costs.csv
-│   ├── load_curve_winter.csv
-│   ├── availability_winter.csv
-│   └── ... (other seasonal files)
-├── assets/                         # GIFs and screenshots
+│ ├── tech_parameters.csv        # Technology definitions
+│ ├── load_curve_winter_*.csv    # Demand scenarios
+│ ├── ev_load_profile.csv        # EV charging shape
+│ ├── resources_availability.csv # Solar / wind availability
+│
+├── assets/                       # README images / GIFs
 ├── requirements.txt
-├── README.md                       # (this file)
+├── README.md
 └── .gitignore
 ```
 
-### ⚙️ Installation & Running Locally
+## ⚙️ Installation & Running Locally
 
-#### 1. Create virtual environment
+Create virtual environment:
 ```
 python3 -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate   # macOS / Linux
 ```
-#### 2. Install dependencies
+
+Install dependencies:
 ```
 pip install -r requirements.txt
 ```
-#### 3. Run the dashboard
+
+Run the app:
 ```
-python3 -m shiny run --reload app/app.py
+python3 -m shiny run --reload src/investment_model.py
 ```
-#### Then visit:
 
-👉 http://127.0.0.1:8000
+Open in browser:
+```
+http://127.0.0.1:8000
+```
 
-## 🧠 Modeling Notes
+## 🧠 Modelling Approach
 
-- Fully reproducible LP implemented using PuLP
-- Supports seasonal load curves provided as CSV
-- Availability profiles imported from seasonal datasets
-- Dispatch feasibility ensures realistic capacity factors
-- Backend functions designed for notebook-based scenario studies
+### 🧮 Optimization
+- Linear Program (PuLP)
+- Exact hourly energy balance
+- Capacity and dispatch linked explicitly
+- Net-zero constraints for balancing / DSM resources
+
+### 🔋 Storage & Smart Grid
+- Battery, pumped hydro, and smart grid treated as balancing resources
+- Charge/discharge symmetry enforced over the day
+- Efficiency losses handled linearly
+
+### 🌞 Renewables
+- Solar, wind, and net metering constrained by hourly availability profiles
+- Net metering tied directly to solar availability
+
+### 🏗️ T&D Improvements
+- Modelled as proportional load reductions
+- Reported clearly as gross vs net load
+- Preserves interpretability in dispatch charts
+
+### 🌍 Emissions & Abatement
+- Technology-specific CO₂ intensity
+- Abatement calculated from actual dispatched energy
+- Supports marginal abatement cost analysis
+
+## 🔧 Development Notes
+- Designed for shinyapps.io deployment
+- Solver logic fully reusable outside Shiny
+- No proprietary data or assumptions
+- Emphasis on transparency and auditability
 
 ## 📄 License
 
@@ -228,6 +160,7 @@ MIT License
 
 Tony Peluso, PhD
 Energy Modelling & Grid Analytics — Montreal, QC
+
 📧 tonympeluso@gmail.com
 
 🔗 GitHub: https://github.com/TonyMPeluso
