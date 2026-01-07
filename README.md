@@ -5,11 +5,8 @@
 
 An interactive Shiny for Python application for investment and dispatch optimization in electric power systems, combining generation, storage, demand-side resources, and backstop imports into a transparent planning framework.
 
-## 🚀 Live Demo
-
-https://tonympeluso.shinyapps.io/investment_optimization/
-
-(link placeholder — update once deployed)
+## 🌐 Live Demo
+👉 [Climate Infrastructure Risk Dashboard]([https://tonympeluso.shinyapps.io/investment_dashboard/])
 
 ## 🌍 Overview
 
